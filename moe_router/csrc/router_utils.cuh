@@ -160,42 +160,38 @@ __device__ inline void fast_topk_and_mask(T *scores, int data_size, int topk, in
   uint32_t local_mask = 0;
 
   for (int k = 0; k < topk; k++) {
-    double local_max_val = -std::numeric_limits<double>::infinity();
+    CompType local_max_val = -std::numeric_limits<CompType>::infinity();
     int local_max_idx = -1;
 
     // 1) Per-lane local max on unmasked elements.
     int bit_idx = 0;
     for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-      if constexpr (false) {
+      CompType cur_val = 0.0f;
+      if constexpr (std::is_same_v<CompType, double>) {
         uint64_t mask = -(uint64_t)((local_mask >> bit_idx) & 1u);
-        uint64_t x_bits = __double_as_longlong(static_cast<double>(scores[i]));
+        uint64_t x_bits = __double_as_longlong(static_cast<CompType>(scores[i]));
         uint64_t result_bits =
           (~mask & x_bits) | (mask & 0xFFF0000000000000ULL);
-        double cur_val = __longlong_as_double(result_bits);  
-        if (cur_val > local_max_val) {
-          local_max_val = cur_val;
-          local_max_idx = i;
-        }
-        bit_idx++;
+        cur_val = __longlong_as_double(result_bits);  
       } else {
         uint32_t full_mask = -(uint32_t)((local_mask >> bit_idx) & 1u);
-        uint32_t x_bits = __float_as_uint(static_cast<float>(scores[i]));
+        uint32_t x_bits = __float_as_uint(static_cast<CompType>(scores[i]));
         uint32_t result_bits =
             (~full_mask & x_bits) | (full_mask & 0xFF800000u);
-        float cur_val = __uint_as_float(result_bits);
-        if (cur_val > local_max_val) {
-          local_max_val = cur_val;
-          local_max_idx = i;
-        }
-        bit_idx++;
+        cur_val = __uint_as_float(result_bits);
       }
+      if (cur_val > local_max_val) {
+        local_max_val = cur_val;
+        local_max_idx = i;
+      }
+      bit_idx++;
     }
 
     // 2) Warp reduction to find global max and index.
-    double global_max_val = local_max_val;
+    CompType global_max_val = local_max_val;
     int global_max_idx = local_max_idx;
     for (int s = kThreadsPerWarp / 2; s > 0; s /= 2) {
-      double shuffled_val = __shfl_down_sync(0xffffffff, global_max_val, s);
+      CompType shuffled_val = __shfl_down_sync(0xffffffff, global_max_val, s);
       int shuffled_idx = __shfl_down_sync(0xffffffff, global_max_idx, s);
       if (shuffled_val > global_max_val) {
         global_max_val = shuffled_val;
