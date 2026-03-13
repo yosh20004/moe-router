@@ -152,48 +152,83 @@ __device__ inline void apply_softmax_on_float(float* scores, int data_size, int 
   __syncwarp();
 }
 
+template <typename T>
+__device__ inline void fast_topk_and_mask(T *scores, int data_size, int topk, int *topk_indices,
+                                          T *topk_scores, int lane_id) {
+  // from manbo(https://github.com/XiaomingFun233)
+  // Bit i indicates whether the i-th local element (lane_id + i * warp_size) was selected.
+  uint32_t local_mask = 0;
+
+  for (int k = 0; k < topk; k++) {
+    double local_max_val = -std::numeric_limits<double>::infinity();
+    int local_max_idx = -1;
+
+    // 1) Per-lane local max on unmasked elements.
+    int bit_idx = 0;
+    for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+      if constexpr (false) {
+        uint64_t mask = -(uint64_t)((local_mask >> bit_idx) & 1u);
+        uint64_t x_bits = __double_as_longlong(static_cast<double>(scores[i]));
+        uint64_t result_bits =
+          (~mask & x_bits) | (mask & 0xFFF0000000000000ULL);
+        double cur_val = __longlong_as_double(result_bits);  
+        if (cur_val > local_max_val) {
+          local_max_val = cur_val;
+          local_max_idx = i;
+        }
+        bit_idx++;
+      } else {
+        uint32_t full_mask = -(uint32_t)((local_mask >> bit_idx) & 1u);
+        uint32_t x_bits = __float_as_uint(static_cast<float>(scores[i]));
+        uint32_t result_bits =
+            (~full_mask & x_bits) | (full_mask & 0xFF800000u);
+        float cur_val = __uint_as_float(result_bits);
+        if (cur_val > local_max_val) {
+          local_max_val = cur_val;
+          local_max_idx = i;
+        }
+        bit_idx++;
+      }
+    }
+
+    // 2) Warp reduction to find global max and index.
+    double global_max_val = local_max_val;
+    int global_max_idx = local_max_idx;
+    for (int s = kThreadsPerWarp / 2; s > 0; s /= 2) {
+      double shuffled_val = __shfl_down_sync(0xffffffff, global_max_val, s);
+      int shuffled_idx = __shfl_down_sync(0xffffffff, global_max_idx, s);
+      if (shuffled_val > global_max_val) {
+        global_max_val = shuffled_val;
+        global_max_idx = shuffled_idx;
+      }
+    }
+    global_max_idx = __shfl_sync(0xffffffff, global_max_idx, 0);
+    global_max_val = __shfl_sync(0xffffffff, global_max_val, 0);
+
+    // 3) Write top-k result.
+    if (lane_id == 0) {
+      topk_indices[k] = global_max_idx;
+      topk_scores[k] = static_cast<T>(global_max_val);
+    }
+
+    // 4) Mark selected element in owning lane's local mask.
+    if (global_max_idx >= 0 && (global_max_idx % kThreadsPerWarp) == lane_id) {
+      int local_bit_pos = global_max_idx / kThreadsPerWarp;
+      if (local_bit_pos < 32) {
+        local_mask |= (1u << local_bit_pos);
+      }
+    }
+  }
+
+  // Keep a single sync point so call-sites can safely consume topk_* from all lanes.
+  __syncwarp();
+}
+
 __device__ inline void naive_topk_and_mask(CompType* scores, int data_size, int topk,
                                            int* topk_indices, CompType* topk_scores,
-                                           int lane_id) {
-  for (int k = 0; k < topk; k++) {
-    bool lane_masked = false;
-    for (int m = 0; m < k; m++) {
-      if (topk_indices[m] == lane_id) {
-        lane_masked = true;
-        break;
-      }
-    }
-    CompType val = (lane_id < data_size && !lane_masked) ? scores[lane_id]
-                                                         : -std::numeric_limits<CompType>::infinity();
-    int index = lane_id < data_size ? lane_id : 0;
-    for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
-      bool cur_masked = false;
-      for (int m = 0; m < k; m++) {
-        if (topk_indices[m] == i) {
-          cur_masked = true;
-          break;
-        }
-      }
-      CompType cur_val = cur_masked ? -std::numeric_limits<CompType>::infinity() : scores[i];
-      if (cur_val > val) {
-        val = cur_val;
-        index = i;
-      }
-    }
-    for (int s = 16; s > 0; s /= 2) {
-      auto shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
-      auto shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
-      if (shuffled_val > val) {
-        val = shuffled_val;
-        index = shuffled_index;
-      }
-    }
-    if (lane_id == 0) {
-      topk_indices[k] = index;
-      topk_scores[k] = val;
-    }
-    __syncwarp();
-  }
+                                           int lane_id) { 
+  // from manbo(https://github.com/XiaomingFun233)
+  fast_topk_and_mask(scores, data_size, topk, topk_indices, topk_scores, lane_id);
 }
 
 template <typename scalar_t>
