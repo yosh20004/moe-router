@@ -78,6 +78,8 @@ std::tuple<Tensor, Tensor, Tensor> fused_score_for_moe_aux_loss_fwd(
   const int num_tokens = logits.size(0);
   const int num_experts = logits.size(1);
   TORCH_CHECK(topk > 0 && topk <= num_experts, "topk must be in (0, num_experts]");
+  TORCH_CHECK(num_experts % 32 == 0,
+              "fused_score_for_moe_aux_loss_fwd currently requires num_experts to be a multiple of 32");
 
   auto logits_contig = logits.contiguous();
   auto scores = torch::empty({num_tokens, num_experts}, logits.options().dtype(torch::kFloat));

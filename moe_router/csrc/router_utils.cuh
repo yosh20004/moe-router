@@ -28,6 +28,24 @@ enum ReduceFuncType {
   MAX = 1,
 };
 
+template <typename scalar_t>
+__device__ inline CompType load_to_comp(const scalar_t* ptr) {
+  return static_cast<CompType>(*ptr);
+}
+
+template <typename scalar_t>
+__device__ inline scalar_t store_from_comp(CompType v) {
+  return static_cast<scalar_t>(v);
+}
+
+template <typename T, int VecSize>
+struct alignas(sizeof(T) * VecSize) AlignedVec {
+  T val[VecSize];
+
+  __device__ inline T& operator[](int idx) { return val[idx]; }
+  __device__ inline const T& operator[](int idx) const { return val[idx]; }
+};
+
 template <typename T>
 __device__ inline T warp_reduce_on_shmem(T* data_ptr, int data_size, ReduceFuncType type,
                                          int lane_id) {
@@ -152,6 +170,104 @@ __device__ inline void apply_softmax_on_float(float* scores, int data_size, int 
   __syncwarp();
 }
 
+__device__ inline CompType warp_reduce_on_regs(const CompType* data, int data_size,
+                                               ReduceFuncType type) {
+  CompType val = type == ReduceFuncType::SUM ? 0.0f
+                                             : -std::numeric_limits<CompType>::infinity();
+  for (int item_idx = 0; item_idx < data_size; ++item_idx) {
+    if (type == ReduceFuncType::SUM) {
+      val += data[item_idx];
+    } else {
+      val = max(val, data[item_idx]);
+    }
+  }
+
+  for (int s = kThreadsPerWarp / 2; s > 0; s /= 2) {
+    CompType other = __shfl_xor_sync(0xffffffff, val, s);
+    if (type == ReduceFuncType::SUM) {
+      val += other;
+    } else {
+      val = max(val, other);
+    }
+  }
+  return val;
+}
+
+__device__ inline void apply_sigmoid_on_regs(CompType* scores, int data_size) {
+  for (int item_idx = 0; item_idx < data_size; ++item_idx) {
+    scores[item_idx] = 1.0f / (1.0f + expf(-scores[item_idx]));
+  }
+}
+
+__device__ inline void apply_sqrtsoftplus_on_regs(CompType* scores, int data_size) {
+  for (int item_idx = 0; item_idx < data_size; ++item_idx) {
+    float x = scores[item_idx];
+    float softplus_val = x > 20.0f ? x : log1pf(expf(x));
+    scores[item_idx] = sqrtf(softplus_val);
+  }
+}
+
+__device__ inline void apply_softmax_on_regs(CompType* scores, int data_size) {
+  float max_val = warp_reduce_on_regs(scores, data_size, ReduceFuncType::MAX);
+  for (int item_idx = 0; item_idx < data_size; ++item_idx) {
+    scores[item_idx] = expf(scores[item_idx] - max_val);
+  }
+  float sum_val = warp_reduce_on_regs(scores, data_size, ReduceFuncType::SUM);
+  for (int item_idx = 0; item_idx < data_size; ++item_idx) {
+    scores[item_idx] = scores[item_idx] / sum_val;
+  }
+}
+
+__device__ inline void fast_topk_and_mask_on_regs(CompType* scores, int data_size, int topk,
+                                                  int* topk_indices, CompType* topk_scores,
+                                                  int lane_id) {
+  uint32_t local_mask = 0;
+
+  for (int k = 0; k < topk; ++k) {
+    CompType local_max_val = -std::numeric_limits<CompType>::infinity();
+    int local_max_idx = -1;
+
+    for (int item_idx = 0; item_idx < data_size; ++item_idx) {
+      CompType cur_val = scores[item_idx];
+      uint32_t full_mask = -(uint32_t)((local_mask >> item_idx) & 1u);
+      uint32_t x_bits = __float_as_uint(cur_val);
+      uint32_t result_bits = (~full_mask & x_bits) | (full_mask & 0xFF800000u);
+      cur_val = __uint_as_float(result_bits);
+      if (cur_val > local_max_val) {
+        local_max_val = cur_val;
+        local_max_idx = lane_id * data_size + item_idx;
+      }
+    }
+
+    CompType global_max_val = local_max_val;
+    int global_max_idx = local_max_idx;
+    for (int s = kThreadsPerWarp / 2; s > 0; s /= 2) {
+      CompType shuffled_val = __shfl_down_sync(0xffffffff, global_max_val, s);
+      int shuffled_idx = __shfl_down_sync(0xffffffff, global_max_idx, s);
+      if (shuffled_val > global_max_val) {
+        global_max_val = shuffled_val;
+        global_max_idx = shuffled_idx;
+      }
+    }
+    global_max_idx = __shfl_sync(0xffffffff, global_max_idx, 0);
+    global_max_val = __shfl_sync(0xffffffff, global_max_val, 0);
+
+    if (lane_id == 0) {
+      topk_indices[k] = global_max_idx;
+      topk_scores[k] = global_max_val;
+    }
+
+    if (global_max_idx >= 0 && (global_max_idx / data_size) == lane_id) {
+      int local_bit_pos = global_max_idx % data_size;
+      if (local_bit_pos < 32) {
+        local_mask |= (1u << local_bit_pos);
+      }
+    }
+  }
+
+  __syncwarp();
+}
+
 template <typename T>
 __device__ inline void fast_topk_and_mask(T *scores, int data_size, int topk, int *topk_indices,
                                           T *topk_scores, int lane_id) {
@@ -225,16 +341,6 @@ __device__ inline void naive_topk_and_mask(CompType* scores, int data_size, int 
                                            int lane_id) { 
   // from manbo(https://github.com/XiaomingFun233)
   fast_topk_and_mask(scores, data_size, topk, topk_indices, topk_scores, lane_id);
-}
-
-template <typename scalar_t>
-__device__ inline CompType load_to_comp(const scalar_t* ptr) {
-  return static_cast<CompType>(*ptr);
-}
-
-template <typename scalar_t>
-__device__ inline scalar_t store_from_comp(CompType v) {
-  return static_cast<scalar_t>(v);
 }
 
 }  // namespace moe_router
